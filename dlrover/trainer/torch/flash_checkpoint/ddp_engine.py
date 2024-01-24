@@ -12,7 +12,6 @@
 # limitations under the License.
 
 import os
-from datetime import timedelta
 from typing import Dict
 
 import torch
@@ -56,15 +55,8 @@ class DdpCheckpointEngine(CheckpointEngine):
 
     def __init__(self, checkpoint_dir, storage):
         super().__init__(checkpoint_dir, storage)
-        if dist.is_initialized():
-            saver_ranks = self._get_saver_ranks()
-            self._saver_group = dist.new_group(
-                ranks=saver_ranks,
-                backend="gloo",
-                timeout=timedelta(seconds=30),
-            )
 
-    def _get_saver_ranks(self):
+    def get_saving_ranks(self):
         """
         Only the local rank 0 in each node saves the state dict into the
         memory. They need to synchronize the saving status.
@@ -104,7 +96,7 @@ class DdpCheckpointEngine(CheckpointEngine):
                 the value is the path of storage to save.
         """
         conf = CheckpointConfig(step=step, paths=paths)
-        self.save_state_dict_to_memory(state_dict, conf)
+        return self.save_state_dict_to_memory(state_dict, conf)
 
     @timer
     def save_to_storage(self, step, state_dict, paths):
@@ -124,12 +116,15 @@ class DdpCheckpointEngine(CheckpointEngine):
         """
         if self._local_rank != 0:
             return
+        succeed = True
         if step > self._cached_step:
-            self.save_to_memory(step, state_dict, paths)
-        event = CheckpointEvent(type=CheckpointEventType.SAVE, step=step)
-
+            succeed = self.save_to_memory(step, state_dict, paths)
         # Only rank 0 persist the checkpoint to the storage.
-        self._event_queue.put(event)
+        if dist.is_initialized():
+            dist.barrier()
+        if succeed and self._rank == 0:
+            event = CheckpointEvent(type=CheckpointEventType.SAVE, step=step)
+            self._event_queue.put(event)
 
     def load(self, resume_path=""):
         """
